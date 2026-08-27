@@ -552,6 +552,9 @@ def bound(uid):
 class PlayerPanel(QtWidgets.QWidget):
 
     _frame_ready = QtCore.Signal(int)          # from a worker -> the GUI thread
+    # The bake runs on its own thread and must not touch a widget from there;
+    # the signal carries the error text, or None when it went well.
+    _ocio_baked = QtCore.Signal(object)
 
     def __init__(self, node_uid=None, parent=None):
         super(PlayerPanel, self).__init__(parent)
@@ -613,6 +616,7 @@ class PlayerPanel(QtWidgets.QWidget):
         self._view_mode = exrnode.VIEW_BASE
         self._split = exrnode.SPLIT_SIDE
         self._frame_ready.connect(self._on_frame_ready)
+        self._ocio_baked.connect(self._on_ocio_baked)
 
         self._build_ui()
 
@@ -2888,23 +2892,37 @@ class PlayerPanel(QtWidgets.QWidget):
             v.set_ocio(self._ocio)
 
     def _bake_ocio(self, display, view, space):
-        """Bakes the input -> linear -> monitor path and redraws RIGHT AWAY.
+        """Starts the bake and returns - the picture catches up when it lands.
 
-        The redraw has to be forced by hand - the transform is still the same
-        object, so the change would otherwise only show up on the next frame.
+        Baking is 145 ms for ACES 1.3 and 319 for ACES 2.0, and it used to run
+        right here, on the thread drawing the panel. Switching a view stopped
+        everything for a third of a second. Now the old transform keeps
+        drawing until the new one is ready.
+
+        The combos are set at once, not when it lands: they say what has been
+        ASKED for, and a menu that springs back for a moment would read as the
+        click not having worked.
         """
+        self._sync_ocio_combos(display, view, space)
+        self._ocio_note = "OCIO: preparing %s..." % view
         try:
-            self._ocio.bake(display, view, space)
-            self._ocio_note = ""
-        except ocio.OcioError as exc:
+            self._ocio.bake_async(display, view, space,
+                                  on_done=self._ocio_baked.emit)
+        except Exception as exc:                  # could not even start
             self._ocio_note = "OCIO: %s" % exc
             return False
-        self._sync_ocio_combos(display, view, space)
+        return True
+
+    def _on_ocio_baked(self, error):
+        """Back on the GUI thread once the bake has landed."""
+        if error:
+            self._ocio_note = "OCIO: %s" % error
+            return
+        self._ocio_note = ""
         for v in self._each_view():
             v.set_ocio(self._ocio)
-            v.invalidate()
-        self._refresh_scopes()          # the scopes describe the displayed values
-        return True
+            v.invalidate()             # the object is the same, so say so by hand
+        self._refresh_scopes()         # the scopes describe the displayed values
 
     def _sync_ocio_combos(self, display, view, space):
         # Viewer Process: the label is "view (device)", the value (display, view)
