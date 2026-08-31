@@ -385,6 +385,13 @@ class ImageView(QtWidgets.QWidget):
         self.qc_full_play = True
 
         self._zoom = 0.0             # 0 = fit
+        # ANAMORPHIC. The pixels are stored square but were shot through a
+        # squeezing lens, so they are only the right SHAPE when the picture is
+        # drawn this much wider than it is stored. It scales the display and
+        # nothing else: the array, the probe coordinates, the scopes and the
+        # notes all stay in stored pixels, which is the only frame of reference
+        # that survives switching the squeeze off again.
+        self._par = 1.0
         self._pan = [0.0, 0.0]
         self._drag = None
         self._syncing = False        # currently taking the view from the other window
@@ -597,7 +604,12 @@ class ImageView(QtWidgets.QWidget):
         alias. Deliberate trade: the band 50-99 % was the slowest place in the
         player and it is where a whole frame is usually reviewed.
         """
-        z = self._effective_zoom()
+        # ONE step serves both axes, so it is set by whichever of them is drawn
+        # LARGER. A desqueezed 2x plate at fit is 0.21 down the screen but only
+        # 0.42 across: decimating 5:1 for the height would throw away half the
+        # columns the width has room for, and the picture would go soft
+        # sideways. With no squeeze max(1, par) is 1 and this is what it was.
+        z = self._effective_zoom() * max(1.0, self._par)
         if z >= 1.0:
             return 1
         return max(1, min(8, int(round(1.0 / z))))
@@ -629,7 +641,7 @@ class ImageView(QtWidgets.QWidget):
                 margin = 0.0
             else:
                 margin = EFFECT_MARGIN if self.effect != fx.NONE else self.margin
-        half_w = vw / (2.0 * z) * (1.0 + margin)
+        half_w = vw / (2.0 * self._zoom_x(z)) * (1.0 + margin)
         half_h = vh / (2.0 * z) * (1.0 + margin)
         x0 = int(max(0, cx - half_w))
         y0 = int(max(0, cy - half_h))
@@ -660,15 +672,36 @@ class ImageView(QtWidgets.QWidget):
         x0, y0, x1, y1 = box
         s = max(1, step)
         if self.effect in fx.BLUR_HEAVY:
-            # Bound the COMPUTE (not the display) by the supersample budget.
-            # Pick the coarsest-affordable compute step `es`, then the display
-            # step is the screen step rounded UP to a multiple of es, so the
-            # result averages down to it cleanly (see _supersample_step /
-            # _block_mean). Zoomed in the crop is small, es stays 1 and the
-            # display step stays 1 - crisp, no average-down. Zoomed out es rises
-            # and the result is averaged, so the grain stays fine and steady
-            # instead of crawling. This replaces the old "raise the display step
-            # to fit", which smeared the zoomed-in view.
+            # THE DISPLAY STEP IS WHAT THE ZOOM ASKED FOR, NEVER COARSER.
+            #
+            # This used to raise it to fit a pixel budget, and the comment at
+            # GRAIN_SS_BUDGET claimed that at 100 % zoom the crop "sits under
+            # this and is computed exactly". It does not, on any panel bigger
+            # than about 2048x1152: at 1:1 on a 2560x1440 view the grain was
+            # computed at step 2, and at step 3 while anything moved. Drawn
+            # magnified, that is a soft picture of every second pixel - and a
+            # grain check that subsamples is not showing grain at all, which
+            # is the one thing it exists to do.
+            #
+            # Zoomed OUT the budget still applies, through _supersample_step:
+            # there the display step is already above 1, so the check can be
+            # computed at a divisor of it and averaged down. That path is
+            # correct - the averaging is what keeps the grain from crawling.
+            # It just must not be allowed to coarsen past the zoom.
+            #
+            # WHILE SOMETHING IS MOVING it still may, and that is the point of
+            # _fast: a scrub or a playing frame gets the cheap coarse render,
+            # and 130 ms after everything goes quiet _refine_now re-renders at
+            # the zoom's own step (see _begin_fast). What was wrong before was
+            # not the coarse render - it was that the REFINED one was coarse
+            # too, so on a panel over about 2048x1152 the grain was never once
+            # shown at full resolution, however long you waited.
+            # qc_full_play wins outright, exactly as it does in _ss_budget:
+            # switching it on while a coarse render is already up has to take
+            # effect on the next frame, not when the refinement happens to
+            # fire.
+            if self.qc_full_play or not self._fast:
+                return s
             area = max(1, x1 - x0) * max(1, y1 - y0)
             budget = self._ss_budget()
             es = 1
@@ -1249,10 +1282,29 @@ class ImageView(QtWidgets.QWidget):
         w, h = self.image_size
         if not w or not h:
             return 1.0
-        return min(self.width() / float(w), self.height() / float(h))
+        # against the DESQUEEZED width - fitting an anamorphic plate by its
+        # stored width would leave it hanging out of the window
+        return min(self.width() / float(w * self._par),
+                   self.height() / float(h))
 
     def _effective_zoom(self):
         return self._fit_zoom() if self._zoom <= 0.0 else self._zoom
+
+    def set_pixel_aspect(self, par):
+        """How much wider than stored the picture is drawn. 1 = no squeeze."""
+        par = max(0.1, min(10.0, float(par or 1.0)))
+        if abs(par - self._par) < 1e-6:
+            return
+        self._par = par
+        self._moved()               # the fit, the visible box and the pan all move
+
+    @property
+    def pixel_aspect(self):
+        return self._par
+
+    def _zoom_x(self, z=None):
+        """The horizontal scale: the zoom, widened by the squeeze."""
+        return (self._effective_zoom() if z is None else z) * self._par
 
     def zoom_percent(self):
         return self._effective_zoom() * 100.0
@@ -1311,7 +1363,7 @@ class ImageView(QtWidgets.QWidget):
         pos = event_pos(event)
         dx = pos.x() - self.width() / 2.0
         dy = pos.y() - self.height() / 2.0
-        self._pan[0] += dx * (1.0 / old - 1.0 / new)
+        self._pan[0] += dx / self._par * (1.0 / old - 1.0 / new)
         self._pan[1] += dy * (1.0 / old - 1.0 / new)
         self._zoom = new
         self._moved()
@@ -1382,7 +1434,7 @@ class ImageView(QtWidgets.QWidget):
             self._emit_probe(p)
             return
         z = self._effective_zoom()
-        self._pan[0] -= (p.x() - self._drag.x()) / z
+        self._pan[0] -= (p.x() - self._drag.x()) / self._zoom_x(z)
         self._pan[1] -= (p.y() - self._drag.y()) / z
         self._drag = p
         self._moved()
@@ -1425,9 +1477,10 @@ class ImageView(QtWidgets.QWidget):
         if not w or not h:
             return None
         z = self._effective_zoom()
-        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * z
+        zx = self._zoom_x(z)
+        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * zx
         oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
-        ix = int((pos.x() - ox) / z)
+        ix = int((pos.x() - ox) / zx)
         iy = int((pos.y() - oy) / z)
         if clamp:
             return max(0, min(w - 1, ix)), max(0, min(h - 1, iy))
@@ -1594,26 +1647,37 @@ class ImageView(QtWidgets.QWidget):
 
         w, h = self.image_size            # the FULL image size
         rx0, ry0, cols, rows, rstep = self._rendered
-        # Smooth whenever the rendered image is MAGNIFIED on screen, i.e. one
-        # rendered pixel covers more than one screen pixel (rstep * z > 1). That
-        # is the zoomed-out case (z < 1) as before, but ALSO the coarse fast
-        # grain render (rstep > 1 at z = 1): bilinear makes its half-res grain
-        # read as slightly soft fine grain instead of hard blocks, so it barely
-        # changes when the full-resolution refinement lands.
+        # ABOVE 100 % ZOOM, NEVER SMOOTH.
+        #
+        # Zooming in is how you look at individual pixels - at grain, at a
+        # paint edge, at one stuck sample. Bilinear there does not soften a
+        # rendering artefact, it softens THE DATA, and a check that shows you
+        # a blurred version of the pixels you asked to see is worse than no
+        # check. Hard square pixels are what every image inspector shows and
+        # what this one has to show too.
+        #
+        # The old rule was `rstep * z > 1`, meant for the coarse fast render
+        # (rstep > 1 at z = 1), where bilinear makes half-resolution grain read
+        # as slightly soft grain rather than blocks, so the full-resolution
+        # refinement lands without a visible jump. That case is kept - it is
+        # only ever at or below 100 %. Plain magnification was caught by the
+        # same test by accident, because z > 1 satisfies it on its own.
+        magnified = z > 1.001
         painter.setRenderHint(QtGui.QPainter.SmoothPixmapTransform,
-                              rstep * z > 1.001)
+                              not magnified and rstep * z > 1.001)
         # the top left corner of the WHOLE image on screen
-        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * z
+        zx = self._zoom_x(z)             # widened if the plate is anamorphic
+        ox = self.width() / 2.0 - (self._pan[0] + w / 2.0) * zx
         oy = self.height() / 2.0 - (self._pan[1] + h / 2.0) * z
-        target = QtCore.QRectF(ox + rx0 * z, oy + ry0 * z,
-                               cols * rstep * z, rows * rstep * z)
+        target = QtCore.QRectF(ox + rx0 * zx, oy + ry0 * z,
+                               cols * rstep * zx, rows * rstep * z)
         painter.drawImage(target, self._qimage)
 
         # The notes go on LAST and use the same ox/oy/z the picture was drawn
         # with, so they sit on the pixels they were drawn on at any zoom.
         if self.annotations is not None:
             self.annotations.draw(painter, self.annot_frame, ox, oy, z,
-                                  self.current_look(), w, h)
+                                  self.current_look(), w, h, zoom_x=zx)
             if self._stroke and len(self._stroke) > 1:
                 pen = QtGui.QPen(QtGui.QColor(*annotate.COLORS[
                     self.annot_color % len(annotate.COLORS)]))
@@ -1623,5 +1687,5 @@ class ImageView(QtWidgets.QWidget):
                 painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
                 painter.setPen(pen)
                 painter.drawPolyline(QtGui.QPolygonF(
-                    [QtCore.QPointF(ox + x * z, oy + y * z)
+                    [QtCore.QPointF(ox + x * zx, oy + y * z)
                      for x, y in self._stroke]))

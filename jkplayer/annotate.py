@@ -279,7 +279,7 @@ class Annotations(object):
 
     # ---- drawing -------------------------------------------------------
     def draw(self, painter, frame, ox=0.0, oy=0.0, zoom=1.0, look=None,
-             width=0, height=0):
+             width=0, height=0, zoom_x=None):
         """Draws the notes of one frame.
 
         `ox`/`oy`/`zoom` place the image on whatever is being painted - the
@@ -287,12 +287,19 @@ class Annotations(object):
         they default to the identity. `width`/`height` are the image size in
         pixels, which notes are wrapped and held inside; 0 leaves them alone.
 
+        `zoom_x` is the horizontal scale when it differs from `zoom` - an
+        anamorphic plate is drawn wider than it is stored. Only POSITIONS
+        follow it: a stretched note is not a wider note, it is a distorted one,
+        so pen weight and text size keep to `zoom`.
+
         `look` is what is on screen now. Notes made in a DIFFERENT view are
         left out: a circle around a grain problem drawn over a plain plate
         points at nothing. The export passes none, because it has already
         rebuilt the very view the notes were made in.
         """
         frame = int(frame)
+        if zoom_x is None:
+            zoom_x = zoom
         strokes = self._strokes.get(frame)
         texts = self._texts.get(frame)
         if look is not None:
@@ -314,7 +321,8 @@ class Annotations(object):
             pen.setCapStyle(QtCore.Qt.RoundCap)
             pen.setJoinStyle(QtCore.Qt.RoundJoin)
             painter.setPen(pen)
-            path = QtGui.QPolygonF([QtCore.QPointF(ox + x * zoom, oy + y * zoom)
+            path = QtGui.QPolygonF([QtCore.QPointF(ox + x * zoom_x,
+                                                   oy + y * zoom)
                                     for x, y in points])
             painter.drawPolyline(path)
 
@@ -348,7 +356,7 @@ class Annotations(object):
                 for row, line in enumerate(lines):
                     if not line:
                         continue
-                    at = QtCore.QPointF(ox + tx * zoom,
+                    at = QtCore.QPointF(ox + tx * zoom_x,
                                         oy + (ty + row * step) * zoom)
                     painter.setPen(edge)
                     for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):

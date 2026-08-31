@@ -70,11 +70,127 @@ QWidget#cvTopBar QComboBox::drop-down { width: 14px; border: none; }
 QWidget#cvTopBar QComboBox QAbstractItemView {
     background: #3f3f3f; color: #d6d6d6;
     selection-background-color: #5a5a5a;
+    outline: none;
+}
+/* the unpainted check column - see POPUP_STYLE, this is the same fix for the
+   case where the bar's stylesheet does reach the popup */
+QWidget#cvTopBar QComboBox QAbstractItemView::indicator {
+    width: 0px; height: 0px; border: none;
+    background: transparent; image: none;
 }
 QWidget#cvTopBar QFrame[frameShape="5"] {   /* vertical separator */
     color: #262626; background: #262626; max-width: 1px;
 }
 """
+
+# The drop-down list of a top-bar combo. Same colours as the rule above, but
+# they have to be set a second time and by hand - see _opaque_popup.
+POPUP_BG = (0x3F, 0x3F, 0x3F)
+POPUP_FG = (0xD6, 0xD6, 0xD6)
+POPUP_STYLE = (
+    "QAbstractItemView {"
+    " background: #3f3f3f; color: #d6d6d6;"
+    " selection-background-color: #5a5a5a; selection-color: #ffffff;"
+    " border: 1px solid #262626; outline: none;"
+    "}"
+    "QAbstractItemView::item { border: none; padding: 1px 4px; }"
+    "QAbstractItemView::item:selected { background: #5a5a5a; }"
+    # THE CHECKERBOARD IN THE OPEN LIST.
+    #
+    # Qt keeps a column on the left of every row for a check indicator, and
+    # Nuke's style never paints it - so each row carried a small checker
+    # square, and the current row a checkered tick. Nothing in these menus is
+    # checkable (they are all pick-one), so the column is taken to zero rather
+    # than given a colour: an indicator that means nothing should not be
+    # occupying the space in front of the words either.
+    "QAbstractItemView::indicator {"
+    " width: 0px; height: 0px; border: none;"
+    " background: transparent; image: none;"
+    "}")
+
+
+# Margins, layout spacing and a little room so a group is never squeezed right
+# up against the edge it is about to be hidden for.
+BAR_SLACK = 16
+
+
+def _fit_bar(avail, groups):
+    """Show as many of `groups` as fit in `avail` pixels, from the front.
+
+    The widths come from sizeHint, which a HIDDEN widget still answers - so
+    widening the panel puts everything back in the order it was taken away,
+    and the bar has no memory to get out of step with.
+    """
+    avail -= BAR_SLACK
+    widths = [sum(max(w.sizeHint().width(), w.minimumWidth()) + 4
+                  for w in group)
+              for group in groups]
+    keep, total = len(groups), sum(widths)
+    while keep > 1 and total > avail:
+        keep -= 1
+        total -= widths[keep]
+    for i, group in enumerate(groups):
+        wanted = i < keep
+        for w in group:
+            if w.isVisible() != wanted:
+                w.setVisible(wanted)
+    return keep
+
+
+def _opaque_popup(combo):
+    """Gives a combo's drop-down a solid background.
+
+    Without this the open list is drawn over a CHECKERBOARD. A popup is its own
+    top-level window rather than a child of the bar, so the bar's stylesheet
+    does not reliably reach it; and what shows through is the view's VIEWPORT,
+    which a stylesheet on the view does not paint either. The checker is simply
+    how Qt draws a background nobody filled in.
+
+    So the palette is set as well as the stylesheet - the palette is the part
+    that reaches the viewport - and the container Qt wraps the view in is told
+    to fill itself. Doing all three is deliberate: which one is the effective
+    fix depends on the platform style Nuke happens to be running.
+    """
+    # THIS is what removes the checker column, and it is not a stylesheet fix.
+    #
+    # Nuke's style answers SH_ComboBox_Popup with "yes", so Qt renders the
+    # drop-down AS A MENU: QComboMenuDelegate, which reserves a column on the
+    # left for the tick against the current item. The style never paints that
+    # tick, so the column came up as a checkerboard on every row - and no
+    # ::indicator rule could touch it, because a delegate draws it, not a
+    # sub-control. Handing the combo a plain list view and the ordinary styled
+    # delegate takes the menu rendering out of the picture altogether.
+    combo.setView(QtWidgets.QListView())
+    combo.setItemDelegate(QtWidgets.QStyledItemDelegate(combo))
+
+    view = combo.view()
+    if view is None:
+        return
+    pal = view.palette()
+    bg, fg = QtGui.QColor(*POPUP_BG), QtGui.QColor(*POPUP_FG)
+    for role in (QtGui.QPalette.Base, QtGui.QPalette.Window,
+                 QtGui.QPalette.Button, QtGui.QPalette.AlternateBase):
+        pal.setColor(role, bg)
+    for role in (QtGui.QPalette.Text, QtGui.QPalette.WindowText,
+                 QtGui.QPalette.ButtonText):
+        pal.setColor(role, fg)
+    view.setPalette(pal)
+    view.setAutoFillBackground(True)
+    view.setStyleSheet(POPUP_STYLE)
+    viewport = view.viewport()
+    if viewport is not None:
+        viewport.setAutoFillBackground(True)
+        viewport.setPalette(pal)
+    holder = view.parentWidget()          # QComboBoxPrivateContainer
+    if holder is not None:
+        holder.setAttribute(QtCore.Qt.WA_TranslucentBackground, False)
+        holder.setAttribute(QtCore.Qt.WA_NoSystemBackground, False)
+        holder.setAutoFillBackground(True)
+        holder.setPalette(pal)
+    # an editable combo (the zoom one) has a line edit with the same problem
+    edit = combo.lineEdit()
+    if edit is not None:
+        edit.setPalette(pal)
 from .sequence import from_read_node
 from .timeline import Timeline
 
@@ -252,6 +368,8 @@ class _Slot(object):
         self.sequence = None
         self.source_info = "-"
         self.source_size = ""      # "3780x2520 1.50" (see _size_text)
+        self.source_par = 1.0      # pixel aspect AS WRITTEN in the file
+        self.source_probe = {}     # what reader.probe said, to redo the line
         self.layers = []                 # layers in the selected input's file
         self.view = ImageView()
         self.loader = FrameLoader(cache, workers=workers, on_ready=on_ready)
@@ -503,7 +621,7 @@ def _fmt_value(v):
     return text or "0"
 
 
-def _size_text(info):
+def _size_text(info, par=None):
     """"3780x2520 1.50" - size and the aspect it will be SEEN at.
 
     The displayed aspect, not width/height: a plate can be squeezed (an
@@ -513,11 +631,18 @@ def _size_text(info):
 
     The pixel aspect is only mentioned when it is NOT square - saying "PAR 1"
     on every ordinary plate would be noise.
+
+    `par` overrides what the file says, because the node can: a scan written
+    square off an anamorphic negative is common enough that the override is
+    the whole reason the Anamorphic setting exists. Passing None trusts the
+    file.
     """
     w, h = int(info.get("width", 0)), int(info.get("height", 0))
     if w <= 0 or h <= 0:
         return ""
-    par = float(info.get("pixel_aspect", 1.0) or 1.0)
+    if par is None:
+        par = info.get("pixel_aspect", 1.0)
+    par = float(par or 1.0)
     text = "%dx%d  %.2f" % (w, h, (w * par) / float(h))
     if abs(par - 1.0) > 0.001:
         text += " (PAR %g)" % par
@@ -584,9 +709,14 @@ class PlayerPanel(QtWidgets.QWidget):
         self._toggle_note_t = 0.0        # ... and when (it disappears shortly)
         # the QC mode and its sliders are held per window (see _Slot)
         self._ocio = None                # ocio.DisplayTransform, when enabled
+        self._ocio_extra = {}            # input space -> its own transform
+        self._ocio_shared = None         # the fallback space, for _on_ocio_baked
         self._ocio_note = ""             # an OCIO error for the status line
         self._temporal_note = ""         # the temporal check result for this frame
         self._settings = {}
+        self._fitting = False        # inside _fit_bars - see resizeEvent
+        self._read_spaces = {}       # last colorspace seen on each input
+        self._project_colour = None  # last colour settings seen on the root
         self._direction = 1
         self._playing = False
         self._play_t0 = 0.0
@@ -669,8 +799,94 @@ class PlayerPanel(QtWidgets.QWidget):
     def sequence(self):
         return self._slots[self._active].sequence
 
+    def resizeEvent(self, event):
+        super(PlayerPanel, self).resizeEvent(event)
+        self._fit_bars()
+
+    def _fit_bars(self):
+        """Hides whatever the panel has become too narrow to hold.
+
+        A QHBoxLayout given less room than its contents need does not shrink
+        them - it OVERLAPS them, and the bar becomes text printed over text,
+        which is worse than a bar with something missing. Past that width
+        whole groups are hidden instead, from the least useful end.
+
+        Groups, not widgets: dropping a spin box but keeping the word in front
+        of it, or leaving a separator with nothing on either side, would be its
+        own kind of mess.
+        """
+        if self._fitting:
+            return
+        self._fitting = True       # setVisible re-lays out; do not re-enter
+        try:
+            for groups in (getattr(self, "_bar_groups", None),
+                           getattr(self, "_tl_groups", None)):
+                if groups:
+                    _fit_bar(self.width(), groups)
+        finally:
+            self._fitting = False
+
     def _each_view(self):
         return [s.view for s in self._slots]
+
+    def _slot_space(self, slot, shared, valid, s=None):
+        """The input space for ONE window: its input's own, else the shared one.
+
+        A log plate under a linear comp of it is the ordinary delivery, not an
+        exception, so the space belongs to the INPUT rather than to the player.
+        Empty per-input means "whatever Color management says", which is what a
+        node saved before this existed holds, and what someone who never wants
+        to think about it can leave it as.
+
+        `valid` is the list of names this colour path can actually honour -
+        Nuke's transforms or the OCIO config's spaces. A name outside it falls
+        back rather than being handed on to fail somewhere less obvious.
+        """
+        s = self._settings if s is None else s
+        per = s.get("in_space", ())
+        own = per[slot.source] if slot.source < len(per) else ""
+        if own and own in valid:
+            return own
+        return shared
+
+    def _spaces_in_use(self, shared, valid, s=None):
+        """{window index: its input space} - the whole picture in one call."""
+        return dict((slot.index, self._slot_space(slot, shared, valid, s))
+                    for slot in self._slots)
+
+    def _slot_par(self, slot):
+        """How much wider than stored this window should draw its picture.
+
+        The node's Anamorphic setting wins over the file, because the file is
+        what is usually wrong; "from file" (None) falls back to what the header
+        said. With Desqueeze off it is 1 whatever anything says - that is the
+        setting for looking at the delivered pixels.
+        """
+        if not self._settings.get("desqueeze", True):
+            return 1.0
+        chosen = self._settings.get("in_squeeze", ())
+        if slot.source < len(chosen) and chosen[slot.source] is not None:
+            return float(chosen[slot.source])
+        return float(slot.source_par or 1.0)
+
+    def _refresh_size_text(self, slot):
+        """The "3780x2520 2.39" line, at the aspect the window will SHOW."""
+        info = slot.source_probe
+        if not info:
+            return
+        slot.source_size = _size_text(info, self._slot_par(slot))
+        slot.source_info = "%s  %s" % (slot.source_size,
+                                       info.get("compression", "?"))
+
+    def _apply_squeeze(self):
+        """Pushes the squeeze into the windows and into the node's Input line.
+
+        Both windows, because in Sync they can be showing different inputs with
+        different squeezes - which is precisely the comparison this is for.
+        """
+        for slot in self._slots:
+            slot.view.set_pixel_aspect(self._slot_par(slot))
+            self._refresh_size_text(slot)
 
     def _both_slots(self):
         """Are both windows visible? (Sync side by side, Wipe and Overlay
@@ -749,7 +965,8 @@ class PlayerPanel(QtWidgets.QWidget):
         self._mode_combo.currentIndexChanged.connect(self._on_view_mode_ui)
         bar.addWidget(self._mode_combo)
 
-        bar.addWidget(self._vline())
+        sep_top = self._vline()
+        bar.addWidget(sep_top)
 
         self._chan = QtWidgets.QComboBox()
         self._chan.addItems(["RGB", "R", "G", "B", "A", "Luminance"])
@@ -802,7 +1019,34 @@ class PlayerPanel(QtWidgets.QWidget):
             lambda: self._on_zoom_text(self._zoom_combo.currentText()))
         bar.addWidget(self._zoom_combo)
 
+        # every drop-down on this bar, or the open list comes up on a checker
+        for combo in (self._mode_combo, self._chan, self._ocio_view,
+                      self._ocio_in, self._zoom_combo):
+            _opaque_popup(combo)
+
         bar.addStretch(1)
+
+        # UP HERE, AND ON ITS OWN. Caching happens by itself, so the only thing
+        # left to do to the cache is throw it away - and that is a housekeeping
+        # button, not a transport one. Down on the transport bar it sat among
+        # the controls used every minute, which is exactly where a button that
+        # empties several gigabytes should not be.
+        clear_btn = QtWidgets.QPushButton("Clear cache")
+        clear_btn.setToolTip("Empty the RAM cache.\n"
+                             "Only needed to free memory for something else - "
+                             "the range refills itself on its own.")
+        clear_btn.clicked.connect(self._clear_cache)
+        bar.addWidget(clear_btn)
+
+        # same idea as the transport bar - the view mode is what stays
+        self._bar_groups = [
+            [self._mode_combo],
+            [sep_top, self._chan],
+            [self._zoom_combo],
+            [self._ocio_view, self._ocio_in],
+            [clear_btn],
+        ]
+
         root.addWidget(bar_host)
 
         # The stage lays the windows out itself (see _Stage): in Sync into
@@ -933,60 +1177,40 @@ class PlayerPanel(QtWidgets.QWidget):
         tl.setContentsMargins(4, 0, 4, 0)
         tl.setSpacing(4)
 
-        self._start_btn = QtWidgets.QPushButton("|<")
-        self._start_btn.setFixedWidth(30)
-        self._start_btn.setToolTip("To the start of the range")
-        self._start_btn.clicked.connect(lambda: self.goto(self.mark_in))
-        tl.addWidget(self._start_btn)
+        # THE BAR READS LEFT TO RIGHT AS: what the range is, then what is
+        # playing. On the left the delivery (handles) and the marks it drives,
+        # in the middle the transport and the frame it is on. The step and
+        # start/end arrows are gone: J/K/L and the arrow keys already do that
+        # without dragging the mouse across the panel.
+        #
+        # HANDLES FIRST because the marks follow FROM it - reading the other
+        # way round ("in 1009, out 1092, oh, and 8 handles") is the same two
+        # facts in the order that has to be worked backwards.
+        handles_lbl = QtWidgets.QLabel("Handles")
+        tl.addWidget(handles_lbl)
+        self._handles = QtWidgets.QSpinBox()
+        self._handles.setFixedWidth(56)
+        self._handles.setRange(0, 999)
+        self._handles.setToolTip(
+            "How many frames of handle were delivered at EACH end.\n"
+            "8 on a 1001-1100 plate marks the cut as 1009-1092.\n"
+            "It only moves IN and OUT - nothing is hidden or thrown away, and\n"
+            "moving either mark by hand puts this back to 0.")
+        self._handles.valueChanged.connect(self._on_handles)
+        tl.addWidget(self._handles)
 
-        cache_btn = QtWidgets.QPushButton("Cache Range")
-        cache_btn.setToolTip("Cache the IN..OUT range in the background")
-        cache_btn.clicked.connect(self._cache_range)
-        tl.addWidget(cache_btn)
-
-        clear_btn = QtWidgets.QPushButton("Clear")
-        clear_btn.setFixedWidth(52)
-        clear_btn.setToolTip("Empty the RAM cache")
-        clear_btn.clicked.connect(self._clear_cache)
-        tl.addWidget(clear_btn)
-
-        tl.addWidget(self._vline())
-
-        self._back_btn = QtWidgets.QPushButton("<")
-        self._back_btn.setFixedWidth(30)
-        self._back_btn.setToolTip("Play backwards (J)")
-        self._back_btn.clicked.connect(lambda: self._play(-1))
-        tl.addWidget(self._back_btn)
-
-        self._play_btn = QtWidgets.QPushButton("Play")
-        self._play_btn.setCheckable(True)
-        self._play_btn.setFixedWidth(56)
-        self._play_btn.setToolTip("Play / stop (K)")
-        self._play_btn.toggled.connect(self._on_play_toggled)
-        tl.addWidget(self._play_btn)
-
-        self._end_btn = QtWidgets.QPushButton(">|")
-        self._end_btn.setFixedWidth(30)
-        self._end_btn.setToolTip("To the end of the range")
-        self._end_btn.clicked.connect(lambda: self.goto(self.mark_out))
-        tl.addWidget(self._end_btn)
-
-        self._mode = QtWidgets.QComboBox()
-        self._mode.addItems(["Loop", "Ping-pong", "Once"])
-        self._mode.setFixedWidth(92)
-        self._mode.setToolTip("What to do at the end of the range")
-        self._mode.currentIndexChanged.connect(self._on_mode_ui)
-        tl.addWidget(self._mode)
-
-        tl.addWidget(self._vline())
-        tl.addWidget(QtWidgets.QLabel("In"))
+        sep_marks = self._vline()
+        tl.addWidget(sep_marks)
+        in_lbl = QtWidgets.QLabel("In")
+        tl.addWidget(in_lbl)
         self._in_spin = QtWidgets.QSpinBox()
         self._in_spin.setFixedWidth(70)
         self._in_spin.setToolTip("Mark IN (the I key sets it to the current frame)")
         self._in_spin.valueChanged.connect(self._on_inout_spin)
         tl.addWidget(self._in_spin)
 
-        tl.addWidget(QtWidgets.QLabel("Out"))
+        out_lbl = QtWidgets.QLabel("Out")
+        tl.addWidget(out_lbl)
         self._out_spin = QtWidgets.QSpinBox()
         self._out_spin.setFixedWidth(70)
         self._out_spin.setToolTip("Mark OUT (the O key sets it to the current frame)")
@@ -998,6 +1222,58 @@ class PlayerPanel(QtWidgets.QWidget):
         reset.setToolTip("Clear IN/OUT (or the middle mouse button in the timeline)")
         reset.clicked.connect(self._reset_in_out)
         tl.addWidget(reset)
+
+        # THE MIDDLE OF THE BAR, held there by a stretch on each side. The
+        # transport is what the eye comes back to between looks at the picture,
+        # and the middle is where it does not have to be hunted for in a corner
+        # shared with the range controls.
+        tl.addStretch(1)
+
+        # THE FRAME, readable AND typeable, right against Play. The bubble at
+        # the playhead says where you are while you drag, but it cannot be read
+        # at a glance once the mouse has gone somewhere else, and it cannot be
+        # typed into - and "go to 1043" is how a note gets checked. It follows
+        # the playhead wherever the playhead was moved from: scrubbing,
+        # playing, or a key.
+        frame_lbl = QtWidgets.QLabel("Frame")
+        tl.addWidget(frame_lbl)
+        self._frame_spin = QtWidgets.QSpinBox()
+        self._frame_spin.setFixedWidth(70)
+        self._frame_spin.setKeyboardTracking(False)   # jump on Enter, not per digit
+        self._frame_spin.setToolTip(
+            "The frame on screen. Type one to jump there.\n"
+            "It follows the playhead - scrubbing the timeline moves it too.")
+        self._frame_spin.valueChanged.connect(self._on_frame_spin)
+        tl.addWidget(self._frame_spin)
+
+        self._play_btn = QtWidgets.QPushButton("Play")
+        self._play_btn.setCheckable(True)
+        self._play_btn.setFixedWidth(56)
+        self._play_btn.setToolTip("Play / stop (K).\n"
+                                  "J plays backwards, L forwards.\n"
+                                  "The arrow keys step a frame at a time.")
+        self._play_btn.toggled.connect(self._on_play_toggled)
+        tl.addWidget(self._play_btn)
+
+        self._mode = QtWidgets.QComboBox()
+        self._mode.addItems(["Loop", "Ping-pong", "Once"])
+        self._mode.setFixedWidth(92)
+        self._mode.setToolTip("What to do at the end of the range")
+        self._mode.currentIndexChanged.connect(self._on_mode_ui)
+        tl.addWidget(self._mode)
+
+        # NO UP/DOWN ARROWS on any of these.
+        #
+        # Under Nuke's style the little buttons come up as a CHECKERBOARD -
+        # Qt's way of drawing a sub-control the style never painted - so four
+        # of the eight visible items on this bar were rendering as noise.
+        # They are no loss: the wheel over the field and the up/down keys both
+        # still step the value, and every one of these is a number you type
+        # rather than nudge one at a time.
+        for spin in (self._handles, self._in_spin, self._out_spin,
+                     self._frame_spin):
+            spin.setButtonSymbols(QtWidgets.QAbstractSpinBox.NoButtons)
+            spin.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
 
         tl.addStretch(1)
 
@@ -1014,10 +1290,9 @@ class PlayerPanel(QtWidgets.QWidget):
             "Bold = below 0 or above 1.\n"
             "The P key freezes the readout so you can move the mouse away.")
         tl.addWidget(self._probe_lbl)
-        tl.addWidget(self._vline())
+        sep_range = self._vline()
+        tl.addWidget(sep_range)
 
-        # the frame number is right in the timeline (a bubble at the playhead),
-        # a separate spin box is no longer needed
         # The extremes of the whole frame. Next to the FPS because it is
         # read the same way - a glance while something else is going on - and
         # a stray negative or a value up at 60 is the first thing a check is
@@ -1036,13 +1311,30 @@ class PlayerPanel(QtWidgets.QWidget):
             "Held frames only: during playback it would cost more than it is\n"
             "worth and could not be read anyway.")
         tl.addWidget(self._range_lbl)
-        tl.addWidget(self._vline())
+        sep_fps = self._vline()
+        tl.addWidget(sep_fps)
 
         self._fps_lbl = QtWidgets.QLabel("-- fps")
         self._fps_lbl.setFixedWidth(66)
         self._fps_lbl.setAlignment(QtCore.Qt.AlignCenter)
         self._fps_lbl.setToolTip("Real playback FPS")
         tl.addWidget(self._fps_lbl)
+
+        # WHAT SURVIVES A NARROW PANEL. Most important first; the LAST group is
+        # the first to go. See _fit_bar for why they go at all.
+        #
+        # Play and the frame it sits on are never dropped: with those two the
+        # thing is still a player. Everything else here is also on a key, on
+        # the timeline, or on the node.
+        self._tl_groups = [
+            [frame_lbl, self._frame_spin, self._play_btn],
+            [self._mode],
+            [sep_marks, in_lbl, self._in_spin, out_lbl, self._out_spin, reset],
+            [handles_lbl, self._handles],
+            [sep_fps, self._fps_lbl],
+            [sep_range, self._range_lbl],
+            [self._probe_lbl],
+        ]
         root.addLayout(tl)
 
         # the status line at the very bottom left
@@ -2059,14 +2351,83 @@ class PlayerPanel(QtWidgets.QWidget):
         self._apply_settings(node)
         count = exrnode.input_count(node)     # an old NoOp node has only one
         timing = self._settings.get("in_timing", ())
+        spaces, changed = {}, False
         for i in range(len(self._sequences)):
             src = node.input(i) if i < count else None
+            spaces[i] = exrnode.read_colorspace(src) if src else None
             start_at, nudge = timing[i] if i < len(timing) else (0, 0)
             seq = from_read_node(src, start_at, nudge)
             if seq != self._sequences[i]:
                 self._set_input_sequence(i, seq)
+                changed = True
+        # ON A CHANGE, AND ONLY ON A CHANGE. Following the Read every tick
+        # would make the player's own control useless - it would be overwritten
+        # 400 ms after every time it was touched. Acting on the TRANSITION
+        # instead means the Read leads, and anything set here afterwards holds
+        # until the Read says something different.
+        self._follow_project_colour()
+        if changed or spaces != self._read_spaces:
+            self._read_spaces = spaces
+            self._follow_read_colorspace(spaces)
         self._describe_inputs(node)
         self._hint = self._input_hint(node, count)
+
+    def _follow_project_colour(self):
+        """Project Settings lead the display side, live.
+
+        On a TRANSITION, never on the standing value. The first look only
+        writes down where the project already was - a node loaded out of a
+        saved script has its own settings and they are not to be trampled just
+        because the panel opened. After that, changing Project Settings changes
+        the player, and changing the player holds until Project Settings move
+        again.
+        """
+        want = exrnode.project_colour()
+        if want == self._project_colour:
+            return
+        known, self._project_colour = self._project_colour, want
+        if known is None:
+            return                          # the first look: only remember it
+        for knob, value in want.items():
+            if known.get(knob) == value:
+                continue                    # this one did not move
+            self._write_knob(knob, value)
+
+    def _follow_read_colorspace(self, spaces):
+        """Takes the input space from the Read, whenever the Read changes it.
+
+        The project says what the WORKING space is; the Read says what the FILE
+        is in. Those are different questions, and it is the second one that
+        matters here - we decode the file ourselves rather than letting Nuke do
+        it, so nothing has linearised the pixels before we get them and the
+        display transform has to be told what it is looking at.
+
+        COMP WINS over Plate, and Plate is used only when nothing is on Comp.
+        There is one input space for both windows, so a log plate under a linear
+        comp cannot be served by both; the comp is the thing being reviewed, so
+        it is the one that gets to be right. The setting stays a plain control -
+        change it and it holds, until an input is connected again.
+        """
+        ocio_mode = self._settings.get("color_mgmt") == exrnode.MGMT_OCIO
+        have = self._settings.get("in_space", ())
+        for i in sorted(spaces):
+            raw = spaces[i]
+            if not raw or i >= len(exrnode.INPUT_KEYS):
+                continue
+            if ocio_mode:
+                # an OCIO project names OCIO colorspaces, so the name passes
+                # straight through - but only if this config actually has it,
+                # otherwise the bake would fail somewhere less obvious
+                if self._ocio is None or raw not in self._ocio.input_spaces():
+                    continue
+                space = raw
+            else:
+                space = nukelut.match_name(raw, nukelut.INPUT_NAMES)
+                if not space:
+                    continue    # a transform we do not have - keep what we had
+            if (have[i] if i < len(have) else "") != space:
+                self._write_knob("cv_in_space_%s" % exrnode.INPUT_KEYS[i],
+                                 space)
 
     def _describe_inputs(self, node):
         """Fills in the read-only 'Input A / B' line on the node.
@@ -2257,6 +2618,12 @@ class PlayerPanel(QtWidgets.QWidget):
                          "ocio_view", "ocio_input", "nuke_display",
                          "nuke_input")):
             self._apply_color(s)
+        # after the sources, since which input a window shows decides which
+        # squeeze applies to it
+        if (s.get("desqueeze") != old.get("desqueeze")
+                or s.get("in_squeeze") != old.get("in_squeeze")
+                or s.get("sources") != old.get("sources")):
+            self._apply_squeeze()
         for widget, key in ((self._chan, "channels"), (self._mode, "loop")):
             if widget.currentIndex() != s[key]:
                 widget.blockSignals(True)
@@ -2385,13 +2752,24 @@ class PlayerPanel(QtWidgets.QWidget):
             return
         self._tl_range = rng
         first, last = rng
-        for w in (self._in_spin, self._out_spin):
+        # the handles are a DELIVERY convention, not a property of this range -
+        # 8 either side stays 8 either side when the input changes, so it is
+        # taken out of the way here and put back over the new range below
+        held = self._handles.value()
+        for w in (self._in_spin, self._out_spin, self._frame_spin):
             w.blockSignals(True)
             w.setRange(first, last)
             w.blockSignals(False)
         self.timeline.set_range(first, last)
         self.timeline.set_in_out(first, last)
         self.mark_in, self.mark_out = first, last
+        if held:
+            # set_in_out above went through _on_range_changed, which will have
+            # zeroed the field - the marks it saw were the full range
+            self._handles.blockSignals(True)
+            self._handles.setValue(held)
+            self._handles.blockSignals(False)
+            self._on_handles(held)
         self.frame = max(first, min(last, self.frame))
         self._sync_frame_widgets()
 
@@ -2427,9 +2805,10 @@ class PlayerPanel(QtWidgets.QWidget):
                 slot.source_label(), info.get("reason", "?"), seq.label())
             nuke.tprint("JKplayer: " + self._input_note)
         else:
-            slot.source_size = _size_text(info)
-            slot.source_info = "%s  %s" % (slot.source_size,
-                                           info.get("compression", "?"))
+            slot.source_par = float(info.get("pixel_aspect", 1.0) or 1.0)
+            slot.source_probe = info
+            self._refresh_size_text(slot)
+            slot.view.set_pixel_aspect(self._slot_par(slot))
             nuke.tprint("JKplayer: %s = %s  %s  channels %s  [reader: %s]"
                         % (slot.source_label(), seq.label(), slot.source_info,
                            ",".join(info.get("channels", [])),
@@ -2587,6 +2966,17 @@ class PlayerPanel(QtWidgets.QWidget):
 
     def _sync_frame_widgets(self):
         self.timeline.set_frame(self.frame)
+        # THE ONE PLACE the frame field is written, so it cannot drift from the
+        # playhead whichever way the playhead moved. Signals off: setting it
+        # here must not read back as the user asking to jump somewhere.
+        self._frame_spin.blockSignals(True)
+        self._frame_spin.setValue(self.frame)
+        self._frame_spin.blockSignals(False)
+
+    def _on_frame_spin(self, value):
+        """A frame typed into the field."""
+        if value != self.frame:
+            self.goto(value)
 
     def _on_slider(self, value):
         if value != self.frame:
@@ -2600,6 +2990,14 @@ class PlayerPanel(QtWidgets.QWidget):
             widget.blockSignals(True)
             widget.setValue(value)
             widget.blockSignals(False)
+        # A mark dragged by hand makes the Handles field a lie, so it goes back
+        # to 0. Checked by comparing against what that number WOULD produce,
+        # which needs no flag and cannot get out of step with itself.
+        n = self._handles.value()
+        if n and (mark_in, mark_out) != self._handle_marks(n):
+            self._handles.blockSignals(True)
+            self._handles.setValue(0)
+            self._handles.blockSignals(False)
         if not changed or self.sequence is None:
             return
         # the cache follows the IN..OUT range: move the queue onto the new range
@@ -2621,6 +3019,29 @@ class PlayerPanel(QtWidgets.QWidget):
     def _reset_in_out(self):
         if self.sequence is not None:
             self.timeline.set_in_out(self.sequence.first, self.sequence.last)
+
+    def _handle_marks(self, n):
+        """IN/OUT for n frames of handle at each end, or None without a range."""
+        if self._tl_range is None:
+            return None
+        first, last = self._tl_range
+        lo, hi = first + n, last - n
+        if lo > hi:
+            # more handle claimed than there are frames. Rather than refuse,
+            # collapse to the middle frame - it says plainly that the number is
+            # wrong for this shot, where a silently ignored value would not.
+            lo = hi = (first + last) // 2
+        return lo, hi
+
+    def _on_handles(self, n):
+        """The Handles field: pull both marks in by that many frames.
+
+        0 puts them back on the whole range, which is what Reset does - the two
+        are the same gesture and must not disagree.
+        """
+        marks = self._handle_marks(max(0, int(n)))
+        if marks is not None:
+            self.timeline.set_in_out(*marks)
 
     def _on_mode_ui(self, index):
         """Panel -> node (the node is the source of truth). 0 loop, 1 ping-pong, 2 once."""
@@ -2847,10 +3268,15 @@ class PlayerPanel(QtWidgets.QWidget):
             display = nukelut.DEFAULT_DISPLAY
         if space not in nukelut.INPUT_NAMES:
             space = nukelut.DEFAULT_INPUT
+        by_slot = self._spaces_in_use(space, nukelut.INPUT_NAMES, s)
+        # the combo speaks for the ACTIVE window - it is the one the scopes and
+        # the readout describe, so it is the one a single control can honestly
+        # be about
         self._sync_color_combos(nukelut.DISPLAY_NAMES, display,
-                                nukelut.INPUT_NAMES, space)
-        for view in self._each_view():
-            view.set_nuke_color(display, space)
+                                nukelut.INPUT_NAMES,
+                                by_slot.get(self._active, space))
+        for slot in self._slots:
+            slot.view.set_nuke_color(display, by_slot[slot.index])
         self._refresh_scopes()
 
     def _apply_ocio(self, s):
@@ -2867,6 +3293,7 @@ class PlayerPanel(QtWidgets.QWidget):
         path = configs[idx][1]
 
         if self._ocio is None or self._ocio.config_path != path:
+            self._ocio_extra = {}          # a new config invalidates every one
             try:
                 self._ocio = ocio.DisplayTransform(path)
             except ocio.OcioError as exc:
@@ -2879,19 +3306,64 @@ class PlayerPanel(QtWidgets.QWidget):
         if (display, view) not in [(d, v) for _l, d, v in pairs]:
             display = self._ocio.default_display()
             view = self._ocio.default_view(display)
-        space = s.get("ocio_input") or self._ocio.default_input
-        if space not in self._ocio.input_spaces():
-            space = self._ocio.default_input
+        shared = s.get("ocio_input") or self._ocio.default_input
+        if shared not in self._ocio.input_spaces():
+            shared = self._ocio.default_input
+        by_slot = self._spaces_in_use(shared, self._ocio.input_spaces(), s)
 
-        if (display, view, space) != (self._ocio.display, self._ocio.view,
-                                      self._ocio.input_space):
-            if not self._bake_ocio(display, view, space):
-                return
-            self._write_ocio_knobs(display, view, space)
-        for v in self._each_view():
-            v.set_ocio(self._ocio)
+        # ONE BAKED TRANSFORM PER DISTINCT SPACE, not per window. Two windows
+        # on the same input share one - the usual case, and the bake is 145 ms
+        # for ACES 1.3, so making two of them for nothing would be felt.
+        # self._ocio stays the ACTIVE window's, because the scopes, the readout
+        # and the combos all speak for that one.
+        self._ocio_shared = shared
+        for space in sorted(set(by_slot.values())):
+            t = self._ocio_for(space)
+            if t is None:
+                continue
+            if (display, view, space) != (t.display, t.view, t.input_space):
+                if not self._bake_ocio(t, display, view, space):
+                    continue
+                if space == by_slot.get(self._active):
+                    self._write_ocio_knobs(display, view)
+        self._push_ocio(by_slot)
 
-    def _bake_ocio(self, display, view, space):
+    def _ocio_for(self, space):
+        """The transform for one input space, made on first use.
+
+        Keyed by space and thrown away with the config, so switching config
+        cannot leave a stale one behind - that would show the previous
+        pipeline's picture in one window and the new one's in the other, which
+        is the worst way to be wrong in a comparison tool.
+        """
+        got = self._ocio_extra.get(space)
+        if got is not None:
+            return got
+        if self._ocio is not None and self._ocio.input_space == space:
+            return self._ocio
+        try:
+            made = ocio.DisplayTransform(self._ocio.config_path)
+        except ocio.OcioError as exc:
+            self._ocio_note = "OCIO: %s" % exc
+            return None
+        self._ocio_extra[space] = made
+        return made
+
+    def _push_ocio(self, by_slot):
+        """Hands each window the transform for ITS input space."""
+        for slot in self._slots:
+            want = by_slot.get(slot.index)
+            t = self._ocio_extra.get(want)
+            if t is None and self._ocio is not None \
+                    and self._ocio.input_space == want:
+                t = self._ocio
+            slot.view.set_ocio(t if t is not None and t.ready() else self._ocio)
+        # the active window's transform is the one everything else speaks for
+        active = self._ocio_extra.get(by_slot.get(self._active))
+        if active is not None:
+            self._ocio = active
+
+    def _bake_ocio(self, target, display, view, space):
         """Starts the bake and returns - the picture catches up when it lands.
 
         Baking is 145 ms for ACES 1.3 and 319 for ACES 2.0, and it used to run
@@ -2906,8 +3378,8 @@ class PlayerPanel(QtWidgets.QWidget):
         self._sync_ocio_combos(display, view, space)
         self._ocio_note = "OCIO: preparing %s..." % view
         try:
-            self._ocio.bake_async(display, view, space,
-                                  on_done=self._ocio_baked.emit)
+            target.bake_async(display, view, space,
+                              on_done=self._ocio_baked.emit)
         except Exception as exc:                  # could not even start
             self._ocio_note = "OCIO: %s" % exc
             return False
@@ -2919,8 +3391,11 @@ class PlayerPanel(QtWidgets.QWidget):
             self._ocio_note = "OCIO: %s" % error
             return
         self._ocio_note = ""
+        shared = getattr(self, "_ocio_shared", None) or (
+            self._ocio.default_input if self._ocio is not None else "")
+        valid = self._ocio.input_spaces() if self._ocio is not None else ()
+        self._push_ocio(self._spaces_in_use(shared, valid))
         for v in self._each_view():
-            v.set_ocio(self._ocio)
             v.invalidate()             # the object is the same, so say so by hand
         self._refresh_scopes()         # the scopes describe the displayed values
 
@@ -2956,14 +3431,22 @@ class PlayerPanel(QtWidgets.QWidget):
             self._ocio_in.setCurrentIndex(names.index(in_sel))
         self._ocio_in.blockSignals(False)
 
-    def _write_ocio_knobs(self, display, view, space):
+    def _write_ocio_knobs(self, display, view, space=None):
+        """Display and view always; the input space only as the SHARED fallback.
+
+        Per-input spaces live on cv_in_space_a/b and are written by
+        _set_active_space. cv_ocio_input is what an input with nothing of its
+        own falls back to, so it is only written when something deliberately
+        sets the fallback - not on every bake.
+        """
         node = self._get_node()
         if node is None:
             return
         try:
             node["cv_ocio_display"].setValue(display)
             node["cv_ocio_view"].setValue(view)
-            node["cv_ocio_input"].setValue(space)
+            if space is not None:
+                node["cv_ocio_input"].setValue(space)
         except Exception as exc:
             # MUST NOT be swallowed: when the write fails (e.g. a missing knob
             # on an old node), 400 ms later the watcher puts the choice back
@@ -2985,37 +3468,62 @@ class PlayerPanel(QtWidgets.QWidget):
                                 self._ocio_in.currentText())
 
     def _on_nuke_color(self):
-        """A choice in the built-in mode - also right away, not on the next watcher tick."""
+        """A choice in the built-in mode - also right away, not on the next watcher tick.
+
+        The DISPLAY is the monitor and belongs to the panel; the input space is
+        the file and belongs to the window's input, so the combo writes it onto
+        that input alone. Picking a space while looking at the plate must not
+        re-describe the comp as well.
+        """
         display = self._ocio_view.currentData() or nukelut.DEFAULT_DISPLAY
         space = self._ocio_in.currentText() or nukelut.DEFAULT_INPUT
-        for view in self._each_view():
-            view.set_nuke_color(display, space)
+        self._set_active_space(space)
+        by_slot = self._spaces_in_use(self._settings.get("nuke_input")
+                                      or nukelut.DEFAULT_INPUT,
+                                      nukelut.INPUT_NAMES)
+        for slot in self._slots:
+            slot.view.set_nuke_color(display, by_slot[slot.index])
         self._refresh_scopes()
         node = self._get_node()
         if node is not None:
             try:
                 node["cv_nuke_display"].setValue(display)
-                node["cv_nuke_input"].setValue(space)
             except Exception as exc:
                 self._ocio_note = "the settings cannot be stored on the node (%s)" % exc
         self._settings["nuke_display"] = display
-        self._settings["nuke_input"] = space
+
+    def _set_active_space(self, space):
+        """Puts a chosen input space onto the input the active window shows."""
+        source = self.active.source
+        if source >= len(exrnode.INPUT_KEYS):
+            return
+        per = list(self._settings.get("in_space", ()))
+        while len(per) < len(exrnode.INPUT_KEYS):
+            per.append("")
+        if per[source] == space:
+            return
+        per[source] = space
+        self._settings["in_space"] = tuple(per)
+        self._write_knob("cv_in_space_%s" % exrnode.INPUT_KEYS[source], space)
 
     def _apply_ocio_choice(self, display, view, space):
         """A choice from the panel: bake RIGHT AWAY, not on the next watcher tick.
 
         The write to the node would otherwise come back only after 400 ms, so
         the image would react to a switch with a delay.
+
+        The view is the monitor and is shared by both windows; the input space
+        is the file and goes onto the input the ACTIVE window shows - the same
+        split as _on_nuke_color. The baking is then left to _apply_ocio, which
+        already knows how to make one transform per distinct space and not one
+        per window.
         """
-        if (display, view, space) != (self._ocio.display, self._ocio.view,
-                                      self._ocio.input_space):
-            if not self._bake_ocio(display, view, space):
-                return
-        self._write_ocio_knobs(display, view, space)
         # so the node watcher does not take our own changes for a new choice
         self._settings["ocio_display"] = display
         self._settings["ocio_view"] = view
-        self._settings["ocio_input"] = space
+        self._write_ocio_knobs(display, view)
+        self._set_active_space(space)
+        self._apply_ocio(self._settings)
 
     # each channel in its own colour - the same one its histogram curve has
     PROBE_COLORS = ("#ff5050", "#50e050", "#6090ff", "#c0c0c0")
@@ -3245,10 +3753,6 @@ class PlayerPanel(QtWidgets.QWidget):
                                anchor=self.frame,
                                direction=self._direction, limit=limit)
 
-    def _cache_range(self):
-        """The Cache Range button: caches the IN..OUT range from the playhead."""
-        self._schedule_cache()
-
     def _maybe_reschedule_cache(self):
         """When the playhead has run away from the anchor, move the cache window forward."""
         if self.sequence is None or not self._settings.get("auto_cache", True):
@@ -3279,14 +3783,26 @@ class PlayerPanel(QtWidgets.QWidget):
     def _sync_alt_numbering(self):
         """Puts input B's own numbers under the cache lanes, when they help.
 
-        Only with two inputs actually being read AND only when B is shifted or
-        covers a different range from A - otherwise the second row would repeat
-        the first one and cost 11 px for nothing.
+        This row exists for ONE case: the two inputs were delivered on
+        different numbering - a plate at 1001-1100 against a render of it at
+        1-100 - where working out which plate frame you are on means doing
+        arithmetic in your head at 8pm.
+
+        So the test is whether the two SOURCES are numbered differently, not
+        whether they sit at different places on the timeline. Those come apart
+        exactly when both inputs are the same camera numbering and one is
+        nudged a frame against the other: the placement differs, the numbering
+        does not, and the row then repeats the file's own count - seven digits
+        under every tick, saying nothing the row above does not.
         """
         a, b = (self._sequences + [None, None])[:2]
-        if a is None or b is None or len(self._live_slots()) < 2 \
-                or (b.offset == a.offset and b.first == a.first
-                    and b.last == a.last):
+        if a is None or b is None or len(self._live_slots()) < 2:
+            self.timeline.set_alt_numbering(None)
+            return
+        # back out the placement to get what each was delivered as
+        a_src = (a.first - a.offset, a.last - a.offset)
+        b_src = (b.first - b.offset, b.last - b.offset)
+        if a_src == b_src:
             self.timeline.set_alt_numbering(None)
             return
         self.timeline.set_alt_numbering(b.offset, b.first, b.last)

@@ -61,11 +61,23 @@ The inputs are **Comp** and **Plate** (tagged `C` and `P` on the buttons inside
 the image). `-` swaps the window between them, which is the quickest A/B there
 is: same frame, same zoom, same place on the eye.
 
-Each input has its own **Start at** and **Offset** on the Playback tab, so a
-1-100 render lines up under a 1001-1100 plate without a TimeOffset node. They
-do not have to be the same length — the timeline follows Comp and the shorter
-side holds its end frame, with its own frame numbers written under the cache
-bars so the two can be lined up by eye.
+Each input has its own page on the node's **Input** tab. **Start at** and
+**Offset** put a 1-100 render under a 1001-1100 plate without a TimeOffset
+node. They do not have to be the same length — the timeline follows Comp and
+the shorter side holds its end frame. When the two were *delivered* on
+different numbering, the plate's own numbers are written under the cache bars
+so they can be lined up by eye; when both come off the same camera numbering
+and one is merely nudged, that row is not drawn, because it would only repeat
+the file's count under every tick.
+
+**Anamorphic** is there too, per input: `from file` trusts the pixel aspect in
+the header, and the fixed ratios are for when it lies — a scan off 2x negative
+is written square by plenty of scanners. It stretches the *drawing* only. The
+pixels, the probe, the scopes and the notes all stay in stored coordinates,
+which is the only frame of reference that survives switching Desqueeze off
+again.
+
+**Colorspace** is per input as well — see Colour below.
 
 **Annotation** — pencil and text over the picture, with the colour and size
 right there in the image. A note remembers WHICH view it was made in, so a
@@ -114,8 +126,41 @@ input at a time. DPX gives the most here — timecode, slate, keycode, frame
 position, the scanner and its serial number.
 
 **Colour** — Nuke's built-in transforms (one table, fast) or full OCIO with the
-studio config. Input transforms for log material (LogC, S-Log3, Cineon,
-Log3G10 and the rest).
+studio config.
+
+The built-in list is **Nuke's list, all 27 of it**: linear, sRGB, sRGBf,
+rec709, Cineon, the four gammas, Panalog, REDLog, ViperLog, AlexaV3LogC,
+PLogLin, SLog/1/2/3, CLog, Log3G10, Log3G12, HybridLogGamma, Protune, BT1886,
+st2084, Blackmagic Film Generation 5 and ARRILogC4. The curves are transcribed
+from Foundry's own generator — `make.py` in the `nuke-default` OCIO config,
+which is the script that wrote the `.spi1d` files Nuke ships — and every one
+was then checked back against that config through PyOpenColorIO over the whole
+code range, in both directions. Where Foundry's code disagrees with the spec
+sheet it is copied **as shipped**: being closer to correct than Nuke would mean
+our picture and Nuke's disagree, which is the one thing a review player must
+not do.
+
+The **input space belongs to the input, not to the player**. A log plate under
+a linear comp of it is the ordinary delivery, so Comp and Plate each carry
+their own, and in Sync the two windows are transformed differently at the same
+time. Under OCIO that means one baked transform per distinct space — two
+windows on the same input share one, because a bake is 145 ms for ACES 1.3.
+
+Both are filled in for you, and neither takes the choice away:
+
+* **Project Settings lead the display side, live.** Switch the script from
+  Nuke to OCIO, change the config or the monitor LUT, and the player follows.
+* **The Read leads the input side.** Nuke's own Input Transform on each Read
+  becomes that input's colorspace — `default (Cineon)` and `Cineon` both, since
+  the auto-detected name is taken out of the brackets.
+* **What you set in the player holds** until the thing that fed it says
+  something different. Both work on the *transition*, never on the standing
+  value, so a node loaded out of a saved script is never trampled just because
+  the panel opened.
+
+A name the current path cannot honour is dropped rather than passed on: a knob
+reading `ACEScct` on a player with no such transform is a worse answer than the
+default it would have replaced.
 
 ## Requirements
 
@@ -276,6 +321,30 @@ plates that already match.
 A Viewer cannot be attached either. The node deliberately renders nothing —
 display is the panel's job.
 
+### The bar under the timeline
+
+```
+Handles [  ] | In [    ] Out [    ] Reset      Frame [    ] Play  Loop
+```
+
+Handles first, because the marks follow from it: **Handles** is how many frames
+were delivered either side of the cut, and setting it pulls IN and OUT in by
+that many — 8 on a 1001-1100 plate marks the cut as 1009-1092. Nothing is
+hidden and the handles stay playable; the timeline dims them the way it dims
+anything outside IN/OUT. Moving either mark by hand puts the field back to 0,
+so it can never claim something the marks do not say.
+
+**Frame** shows what is on screen and can be typed into. The bubble at the
+playhead says where you are while you drag, but it cannot be read once the
+mouse has gone elsewhere and cannot be typed into — and "go to 1043" is how a
+note gets checked.
+
+Narrow the panel and whole groups disappear rather than overlapping, from the
+least useful end: the readouts first, then the range controls. **Play and the
+frame it is on never go** — with those two it is still a player, and everything
+else here is also on a key. Widen it again and they come back in the order they
+left.
+
 ### Keys
 
 ```
@@ -337,6 +406,16 @@ compression, the colour transforms against OCIO, the scopes, the QC modes,
 every knob on the node, the geometry Qt only draws, and a static pass over the
 whole package. The Qt layer itself cannot be tested inside Nuke at all — see
 Tests.
+
+**The colour transforms** are the strongest of those, because there is
+something exact to check against: all 27 are compared to the `nuke-default`
+OCIO config over the whole code range. Decoding matches to 5e-5 at worst and
+around 1e-6 typically — float precision — and every one round-trips. The
+display direction matches on 26 of 27. The odd one out is HybridLogGamma near
+black, and it is not a disagreement about the maths: Foundry's curve is `x*x/3`
+below encoded 0.5, so it is symmetric about zero and the table it produces has
+no inverse there. Ours is the exact inverse of Foundry's own formula; OCIO's is
+an artefact of inverting something that cannot be inverted.
 
 Reports from other platforms are welcome; that table is how it gets shorter.
 

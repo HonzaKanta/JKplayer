@@ -50,6 +50,38 @@ NODE_CLASSES = ("Group", "NoOp")
 #   LABELS are what people read: on the node, on the DAG arrows, in messages
 #   TAGS   are the short form for the buttons INSIDE the image, where there is
 #          room for one letter and a full word would swamp the picture
+# ANAMORPHIC SQUEEZE, per input.
+#
+# The first entry means "believe the file" - EXR carries pixelAspectRatio and
+# DPX carries an aspect, and when they are right there is nothing to set. The
+# rest are the squeezes that actually come through the door, and they are here
+# because the file is very often WRONG: a plate scanned off 2x anamorphic
+# negative is written square by plenty of scanners, and a comp rendered from it
+# inherits whatever the script it came out of said.
+#
+# Enumeration knobs are saved by their TEXT, so these strings are now permanent.
+SQUEEZE_CHOICES = ("from file", "1", "1.3", "1.33", "1.5", "1.8", "2", "custom")
+SQUEEZE_FROM_FILE = 0
+SQUEEZE_CUSTOM = len(SQUEEZE_CHOICES) - 1
+
+
+def squeeze_value(index, custom):
+    """The chosen squeeze as a number, or None for "take it from the file"."""
+    try:
+        index = int(index)
+    except (TypeError, ValueError):
+        return None
+    if index <= SQUEEZE_FROM_FILE or index >= len(SQUEEZE_CHOICES):
+        return None
+    if index == SQUEEZE_CUSTOM:
+        try:
+            custom = float(custom)
+        except (TypeError, ValueError):
+            return None
+        return custom if 0.1 <= custom <= 10.0 else None
+    return float(SQUEEZE_CHOICES[index])
+
+
 INPUT_KEYS = ("a", "b")
 INPUT_LABELS = ("Comp", "Plate")
 INPUT_TAGS = ("C", "P")
@@ -428,16 +460,6 @@ def _add_knobs(node):
                          % (tip, label))
             add(k)
 
-        # Opacity belongs with the scopes, so it sits right below them. It is
-        # shared and the scopes only exist in Base, so window 1 is enough.
-        if slot == SLOT_LABELS[0]:
-            k = nuke.Double_Knob("cv_scope_opacity", "Scope opacity")
-            k.setValue(DEFAULT_SCOPE_OPACITY)
-            k.setRange(0.0, 1.0)
-            k.setTooltip("Opacity of the histogram and vectorscope backdrop.\n"
-                         "1 = opaque, 0 = just outlines over the image.")
-            add(k)
-
         k = nuke.Enumeration_Knob("cv_effect_%s" % slot, "QC mode",
                                   [effects.LABELS[e] for e in effects.ORDER])
         k.setTooltip(EFFECT_TIP)
@@ -474,7 +496,25 @@ def _add_knobs(node):
     k.setTooltip("Playback stays inside the cached region (like RV).")
     add(k)
 
-    # ---- where each input sits in time ----
+    # ---- Input ----
+    # A TAB OF ITS OWN. These used to sit at the bottom of Playback, under
+    # the FPS and the loop mode, which put "what is attached and where it
+    # sits in time" behind "how fast to play it". They are the first thing
+    # set up on a new node, and the thing gone back to whenever a
+    # comparison looks a frame out, so they get a page rather than a
+    # scroll to the bottom of somebody else's.
+    add(nuke.Tab_Knob("cv_input_tab", "Input"))
+
+    k = nuke.Boolean_Knob("cv_desqueeze", "Desqueeze")
+    k.setValue(True)
+    k.setFlag(nuke.STARTLINE)
+    k.setTooltip("Draw anamorphic material at the SHAPE it was shot at - the "
+                 "picture is stretched sideways by the squeeze set below.\n"
+                 "Off shows the stored pixels as they are, narrow.\n"
+                 "Display only: the pixels, the probe, the scopes and the "
+                 "notes stay in stored coordinates, and so does the export.")
+    add(k)
+
     # One block per input, because the two are almost never delivered on the
     # same numbering: a plate comes 1001-1100 and the render of it comes 1-100.
     # They used to have to be lined up with a TimeOffset node outside the
@@ -509,6 +549,62 @@ def _add_knobs(node):
                      "For the usual 'it is one frame out' - the placement stays "
                      "where it is and this says by how much." % label)
         add(k)
+
+        k = nuke.Enumeration_Knob("cv_in_squeeze_%s" % key, "Anamorphic",
+                                  list(SQUEEZE_CHOICES))
+        k.setTooltip("The anamorphic squeeze of input %s.\n"
+                     "'from file' trusts the pixel aspect written in the file "
+                     "- right for an EXR out of a comp, and often wrong for a\n"
+                     "scan, which is why the fixed ratios are here. It is set "
+                     "per input because a 2x plate and a square-rendered comp\n"
+                     "of it are exactly the pair you need to compare.\n"
+                     "Only does anything while 'Desqueeze' is on." % label)
+        add(k)
+
+        k = nuke.Double_Knob("cv_in_squeeze_num_%s" % key, "ratio")
+        k.setValue(2.0)
+        k.setRange(0.1, 4.0)
+        k.clearFlag(nuke.STARTLINE)
+        k.setTooltip("The squeeze used when 'Anamorphic' is set to 'custom'. "
+                     "Ignored on any other setting.")
+        add(k)
+
+        # PER INPUT, because the two are routinely not in the same space: a
+        # log plate under a linear comp of it is the ordinary case, not the
+        # exception. Filled in from the Read on that input; empty falls back to
+        # the one on the Color management tab, which is what a node from before
+        # this existed will do.
+        k = nuke.String_Knob("cv_in_space_%s" % key, "Colorspace", "")
+        k.setTooltip("What input %s is encoded in.\n"
+                     "Taken from the Read wired into it - Nuke's own "
+                     "'Input Transform' - and you can type over it.\n"
+                     "Empty means: use the input space on the Color management "
+                     "tab." % label)
+        add(k)
+
+    # ---- Scopes ----
+    # The histogram, the vectorscope and the waveform are one family and are
+    # read as one, so what belongs to all three lives together - rather than
+    # tucked under window 1 of the Viewer tab, which is where the opacity was
+    # and where nobody would look for it.
+    #
+    # WHICH scopes are on is still not here, and deliberately: that is
+    # switched by H, V and W over the picture, and a second place to set the
+    # same state only ever raises the question of which one is in charge.
+    add(nuke.Tab_Knob("cv_scope_tab", "Scopes"))
+
+    add(nuke.Text_Knob(
+        "cv_scope_head", "",
+        "Switched on over the picture, with H, V and W."))
+
+    k = nuke.Double_Knob("cv_scope_opacity", "Backdrop opacity")
+    k.setValue(DEFAULT_SCOPE_OPACITY)
+    k.setRange(0.0, 1.0)
+    k.setTooltip("Opacity of the backdrop behind the histogram, the "
+                 "vectorscope and the waveform. "
+                 "1 = opaque, 0 = just the graticule and the trace over "
+                 "the image.")
+    add(k)
 
     # ---- Metadata ----
     add(nuke.Tab_Knob("cv_meta_tab", "Metadata"))
@@ -756,6 +852,126 @@ def apply_color_visibility(node):
 
 
 # ---------------------------------------------------------------------------
+def _root_value(name):
+    """One knob off the project root, or None when it is not there.
+
+    Every one of these has been checked to exist in Nuke 17, but they have come
+    and gone across versions - `monitorOutLUT` is newer than `monitorLut` - and
+    a missing one must leave the default alone rather than raise on node
+    creation.
+    """
+    try:
+        value = nuke.root()[name].value()
+    except Exception:
+        return None
+    return value
+
+
+def _pick_name(value, names):
+    """`value` matched against `names`. See nukelut.match_name."""
+    return nukelut.match_name(value, names)
+
+
+def read_colorspace(read):
+    """The colorspace a Read node says its FILE is in, or None.
+
+    Nuke shows an auto-detected choice as "default (sRGB)" rather than as the
+    name on its own, so the name has to be taken out of the brackets; an
+    explicit choice arrives as the plain name. Both spellings of the wrapper
+    are handled because Nuke has written it with and without the space.
+    """
+    try:
+        value = read["colorspace"].value()
+    except Exception:
+        return None                  # not a Read, or a Read without the knob
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    if value.lower().startswith("default") and value.endswith(")"):
+        opened = value.find("(")
+        if opened > 0:
+            value = value[opened + 1:-1].strip()
+    return value or None
+
+
+def project_colour():
+    """The project's colour settings that the player FOLLOWS while it runs.
+
+    The display side only: how colour is managed, which OCIO config, and what
+    the monitor is. Switch Project Settings from Nuke to OCIO and the player
+    goes with you - that is a decision about the whole script, and having the
+    player quietly stay behind on the old one would be the wrong kind of
+    stubborn.
+
+    The INPUT space is deliberately not in here. It follows the Read instead
+    (see panel._follow_read_colorspace), and one knob with two live sources
+    writing into it would be a fight with no winner. The split is also the
+    honest one: the display is a property of the monitor you are sat at, the
+    input space is a property of the file.
+    """
+    out = {}
+    mgmt = _root_value("colorManagement")
+    if isinstance(mgmt, str) and mgmt.strip():
+        out["cv_color_mgmt"] = (MGMT_OCIO if mgmt.strip().lower() == "ocio"
+                                else MGMT_NUKE)
+
+    config = _root_value("OCIO_config")
+    if isinstance(config, str) and config.strip():
+        # only one WE have - the enumeration would refuse anything else and
+        # the failure would surface as an error note on the panel
+        known = [c[0] for c in ocio.find_configs()] if ocio.available() else []
+        if config.strip() in known:
+            out["cv_ocio_config"] = config.strip()
+
+    display = _pick_name(_root_value("monitorLut"), nukelut.DISPLAY_NAMES)
+    if display:
+        out["cv_nuke_display"] = display
+    return out
+
+
+def project_defaults():
+    """What the project settings say a NEW node should start on.
+
+    Everything project_colour() follows for life, plus the two that are only
+    ever a STARTING point: the frame rate, and the working space as the first
+    guess at an input space before any Read has been wired up.
+
+    OCIO display and view are deliberately NOT taken. The root keeps them as
+    one string ("sRGB (ACES)") whose split into display and view cannot be
+    recovered without guessing at the config, and our empty value already
+    means "whatever the config says is default" - which is the same answer,
+    arrived at honestly.
+    """
+    out = project_colour()
+    try:
+        fps = float(nuke.root().fps())
+    except Exception:
+        fps = 0.0
+    if fps > 0:
+        out["cv_fps"] = fps
+
+    working = _pick_name(_root_value("workingSpaceLUT"), nukelut.INPUT_NAMES)
+    if working:
+        out["cv_nuke_input"] = working
+    return out
+
+
+def apply_project_defaults(node):
+    """Puts project_defaults() onto a fresh node. Returns what it managed to set.
+
+    Knob by knob and each in its own try: an OCIO config the project names but
+    this machine does not have would otherwise take the FPS down with it.
+    """
+    done = {}
+    for name, value in project_defaults().items():
+        try:
+            node[name].setValue(value)
+        except Exception:
+            continue        # not our config, not our list - leave the default
+        done[name] = value
+    return done
+
+
 def create():
     """Creates an JKplayer node and returns it.
 
@@ -774,6 +990,8 @@ def create():
         pass                                  # the name exists -> Nuke adds a number
     _build_inputs(node)
     _add_knobs(node)
+    # the project is the first guess for colour and rate - see project_defaults
+    apply_project_defaults(node)
     node["tile_color"].setValue(0x7A3FBFFF)   # purple, so it stands out
     # NO LABEL. It used to carry "[value cv_channels]", so the node in the
     # graph read "RGB" under its name and changed as the channel was switched.
@@ -1136,6 +1354,16 @@ def settings(node):
         "in_timing": tuple(
             (int(val("cv_in_start_%s" % key, 0)),
              int(val("cv_in_offset_%s" % key, 0)))
+            for key in INPUT_KEYS),
+        # the squeeze per input as a NUMBER, or None for "take it from the
+        # file" - only the panel ever sees what the file actually said
+        # per-input colorspace; "" = fall back to the shared one below
+        "in_space": tuple(str(val("cv_in_space_%s" % key, "") or "")
+                          for key in INPUT_KEYS),
+        "desqueeze": bool(val("cv_desqueeze", True)),
+        "in_squeeze": tuple(
+            squeeze_value(enum("cv_in_squeeze_%s" % key, SQUEEZE_FROM_FILE),
+                          val("cv_in_squeeze_num_%s" % key, 2.0))
             for key in INPUT_KEYS),
         "realtime": bool(val("cv_realtime", True)),
         "cached_only": bool(val("cv_play_cached_only", False)),
