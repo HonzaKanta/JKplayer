@@ -2,8 +2,10 @@
 
 A review player for Nuke. It reads the files itself instead of going through
 `nuke.execute`, so playback comes off a RAM cache rather than the comp graph —
-a 1080p ZIP plate decodes at about 55 fps on 8 threads, against 22 fps for
-Nuke's own viewer on the same material.
+a 1080p ZIP plate decodes at 285 fps on 8 threads and 401 at 24, measured warm
+in RAM so it is decode and not disk. Whether that beats Nuke's own viewer is
+**not claimed here**: no Foundry licence has been reachable to measure it, and
+an earlier version of this file put a number on it anyway.
 
 It is a QC tool, not a grading tool: everything in it exists to answer "is this
 plate good to send".
@@ -11,9 +13,10 @@ plate good to send".
 ## Formats
 
 **EXR** — through Nuke's own OpenEXR library when it is there (every
-compression, and about 2.3x faster), with a pure Python reader as the fallback
-for NONE, ZIP and ZIPS. Both were checked against each other and give
-bit-identical results.
+compression, and **5x faster at HD, 10x at 4K** on 8 threads), with a pure
+Python reader as the fallback for NONE, ZIP and ZIPS. Both were checked against
+each other and give bit-identical results. The gap widens with thread count,
+because the fallback stops scaling past 8 while the library keeps going.
 
 **DPX** — 8, 10, 12 and 16 bit, both endiannesses, RGB / RGBA / ABGR /
 luminance. What comes out is the code value normalised to 0–1, not linear
@@ -442,12 +445,20 @@ instrument was blaming the frame for what the colour path did.
 
 Measured on this machine (Ryzen 9 9950X), decoding only:
 
-| | |
-|---|---|
-| 4K EXR ZIP | 103 fps at 24 threads |
-| 4K DPX 10-bit | 25 fps at 16 threads |
-| HD ProRes 422 HQ | 72 fps |
-| 4K ProRes 422 HQ | 15–17 fps |
+| | 8 threads | 24 threads |
+|---|---|---|
+| HD EXR ZIP, Nuke's library | 285 fps | 401 fps |
+| HD EXR ZIP, Python fallback | 58 fps | stops scaling past 8 |
+| 4K EXR ZIP, Nuke's library | 68 fps | 103 fps |
+| 4K EXR ZIP, Python fallback | 7 fps | stops scaling past 8 |
+| 4K DPX 10-bit | | 25 fps at 16 threads |
+| HD ProRes 422 HQ | | 72 fps |
+| 4K ProRes 422 HQ | | 15–17 fps |
+
+Material: ZIP16 half RGB, 7 MB a frame at HD and 28 at 4K, held warm in RAM so
+these measure decoding rather than the disk. On the SATA drives the disk is
+what decides instead — a full cache fill there runs at 19.9 fps against 20.2
+for reading the same bytes with no decode at all.
 
 4K movies are held back by the pipe out of ffmpeg, not by the decoder: 53 MB a
 frame in 16-bit RGB against about 1100 MB/s. HD and 2K have room to spare.
